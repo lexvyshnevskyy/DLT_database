@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import mysql.connector
@@ -92,6 +93,23 @@ class DbConnector:
         except Error as exc:
             self._log("error", f"[DB] Fetch error: {exc}")
             return []
+
+    def initialize_schema(self, schema_path: str) -> bool:
+        self.ensure_connection()
+        if self.cur is None or self.conn is None:
+            return False
+
+        sql = Path(schema_path).read_text(encoding='utf-8')
+        try:
+            for _result in self.cur.execute(sql, multi=True):
+                pass
+            self.conn.commit()
+            self._log("info", f"[DB] Schema initialized from: {schema_path}")
+            return True
+        except Error as exc:
+            self._log("error", f"[DB] Schema initialization failed: {exc}")
+            self.conn.rollback()
+            return False
 
     def close(self) -> None:
         if self.cur is not None:

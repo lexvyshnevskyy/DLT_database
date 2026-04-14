@@ -33,6 +33,7 @@ install(DIRECTORY
 
 install(DIRECTORY
   launch
+  sql
   DESTINATION share/${PROJECT_NAME}
 )
 

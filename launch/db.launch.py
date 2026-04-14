@@ -14,6 +14,7 @@ def generate_launch_description():
     db_user_arg = DeclareLaunchArgument('db_user', default_value='ubuntu')
     db_password_arg = DeclareLaunchArgument('db_password', default_value='raspberry')
     db_name_arg = DeclareLaunchArgument('db_name', default_value='exp')
+    auto_init_schema_arg = DeclareLaunchArgument('auto_init_schema', default_value='true')
 
     node = Node(
         package='database',
@@ -30,6 +31,7 @@ def generate_launch_description():
             'db.user': LaunchConfiguration('db_user'),
             'db.password': LaunchConfiguration('db_password'),
             'db.name': LaunchConfiguration('db_name'),
+            'auto_init_schema': LaunchConfiguration('auto_init_schema'),
         }]
     )
 
@@ -43,5 +45,6 @@ def generate_launch_description():
         db_user_arg,
         db_password_arg,
         db_name_arg,
+        auto_init_schema_arg,
         node,
     ])
