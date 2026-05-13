@@ -12,7 +12,7 @@ def generate_launch_description():
     db_host_arg = DeclareLaunchArgument('db_host', default_value='127.0.0.1')
     db_port_arg = DeclareLaunchArgument('db_port', default_value='3306')
     db_user_arg = DeclareLaunchArgument('db_user', default_value='ubuntu')
-    db_password_arg = DeclareLaunchArgument('db_password', default_value='raspberry')
+    db_password_arg = DeclareLaunchArgument('db_password', default_value='')
     db_name_arg = DeclareLaunchArgument('db_name', default_value='exp')
     auto_init_schema_arg = DeclareLaunchArgument('auto_init_schema', default_value='true')
 
