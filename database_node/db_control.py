@@ -129,6 +129,43 @@ class DbControl:
         except Exception:
             return []
 
+    def set_program_meta(self, program_id: int, key: str, value: str) -> bool:
+        query = """
+            INSERT INTO program_meta (program_id, `key`, `value`)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE `value` = VALUES(`value`);
+        """
+        try:
+            self.db.cur.execute(query, (int(program_id), str(key), str(value)))
+            self.db.conn.commit()
+            return self.db.cur.rowcount > 0
+        except Exception:
+            self.db.conn.rollback()
+            return False
+
+    def get_program_detail(self, program_id: int) -> Dict[str, Any]:
+        row = self.get_program_by_id(program_id)
+        if not row:
+            return {}
+        item_id, dt, status = row
+        meta_rows = self.get_program_meta(program_id)
+        meta = {key: val for _, _, key, val in meta_rows}
+        steps = [
+            {'step_id': step_id, 't_start': t_start, 't_stop': t_stop, 'minutes': minutes}
+            for step_id, _, t_start, t_stop, minutes in self.get_program_params_temp(program_id)
+        ]
+        e720 = self.get_e720(program_id)
+        return {
+            'id': int(item_id),
+            'datetime': dt.isoformat() if hasattr(dt, 'isoformat') else str(dt),
+            'status': str(status),
+            'description': meta.get('description', ''),
+            'meta': meta,
+            'steps': steps,
+            'e720': e720,
+            'measurement_stats': self.get_measurement_stats(program_id),
+        }
+
     def set_program_temp(self, data: Dict[str, Any]) -> int:
         sql = """
         INSERT INTO program_temp (program_id, t_start, t_stop, minutes)

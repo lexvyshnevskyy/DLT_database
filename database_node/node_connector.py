@@ -55,6 +55,8 @@ class DbService(Node, DbControl):
             'program_delete_temp': self.handle_program_delete_temp,
             'set_e720': self.handle_set_e720,
             'get_e720': self.handle_get_e720,
+            'set_program_meta': self.handle_set_program_meta,
+            'get_program_detail': self.handle_get_program_detail,
             'measurement_insert': self.handle_measurement_insert,
             'measurement_bulk_insert': self.handle_measurement_bulk_insert,
             'measurement_list': self.handle_measurement_list,
@@ -159,6 +161,29 @@ class DbService(Node, DbControl):
             return {'result': 'False', 'ID': '0'}
         except Exception as exc:
             return {'result': 'False', 'ID': '0', 'error': str(exc)}
+
+    def handle_set_program_meta(self, val: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            program_id = int(val.get('program_id', val.get('id', 0)))
+            key = str(val.get('key', '')).strip()
+            value = str(val.get('value', ''))
+            if not key:
+                return {'result': 'False', 'error': 'meta key is required'}
+            if self.set_program_meta(program_id, key, value):
+                return {'result': 'Ok'}
+            return {'result': 'False', 'error': 'failed to save meta'}
+        except Exception as exc:
+            return {'result': 'False', 'error': str(exc)}
+
+    def handle_get_program_detail(self, val: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            program_id = int(val.get('id', val.get('program_id', 0)))
+            detail = self.get_program_detail(program_id)
+            if not detail:
+                return {'result': 'False', 'error': f'program {program_id} not found'}
+            return {'result': 'Ok', 'row': detail}
+        except Exception as exc:
+            return {'result': 'False', 'error': str(exc)}
 
     def handle_program_step_insert(self, val: Dict[str, Any]) -> Dict[str, Any]:
         try:
