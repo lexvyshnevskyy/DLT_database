@@ -32,9 +32,26 @@ CREATE TABLE IF NOT EXISTS program_meta (
       ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS program_runs (
+    id INT NOT NULL AUTO_INCREMENT,
+    program_id INT NOT NULL,
+    run_index INT NOT NULL,
+    started_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    stopped_at DATETIME(3) NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'Running',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_program_run_index (program_id, run_index),
+    KEY idx_program_runs_program_id (program_id),
+    KEY idx_program_runs_status (status),
+    CONSTRAINT fk_program_runs_program
+      FOREIGN KEY (program_id) REFERENCES programs(ID)
+      ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS measurements (
     id BIGINT NOT NULL AUTO_INCREMENT,
     program_id INT NOT NULL,
+    run_id INT NULL,
     elapsed_s DOUBLE NOT NULL DEFAULT 0,
     freq DOUBLE NULL,
     measure_ch1 DOUBLE NULL,
@@ -45,8 +62,12 @@ CREATE TABLE IF NOT EXISTS measurements (
     created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     PRIMARY KEY (id),
     KEY idx_measurements_program_id (program_id),
+    KEY idx_measurements_run_id (run_id),
     KEY idx_measurements_elapsed_s (elapsed_s),
     CONSTRAINT fk_measurements_program
       FOREIGN KEY (program_id) REFERENCES programs(ID)
+      ON DELETE CASCADE,
+    CONSTRAINT fk_measurements_run
+      FOREIGN KEY (run_id) REFERENCES program_runs(id)
       ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -12,6 +12,7 @@ class DbControl:
     def __init__(self, connector: DbConnector):
         self.db = connector
         self._program_start_monotonic_ns: Dict[int, int] = {}
+        self._run_start_monotonic_ns: Dict[int, int] = {}
 
     def _scalar(self, query: str, params: Iterable[Any]) -> Optional[Any]:
         self.db.cur.execute(query, tuple(params))
@@ -23,6 +24,236 @@ class DbControl:
     def _resolve_program_id(self, data: Dict[str, Any]) -> int:
         raw_value = data.get('program_id', data.get('exp_id', 0))
         return int(raw_value)
+
+    def _resolve_run_id(self, data: Dict[str, Any]) -> int:
+        return int(data.get('run_id', 0) or 0)
+
+    def _table_exists(self, table_name: str) -> bool:
+        value = self._scalar(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_schema = DATABASE() AND table_name = %s;
+            """,
+            (table_name,),
+        )
+        return bool(value)
+
+    def _column_exists(self, table_name: str, column_name: str) -> bool:
+        value = self._scalar(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = %s
+              AND column_name = %s;
+            """,
+            (table_name, column_name),
+        )
+        return bool(value)
+
+    def ensure_program_run_schema(self) -> bool:
+        """Apply program_runs table and measurements.run_id for existing databases."""
+        if not self._table_exists('program_runs'):
+            self.db.cur.execute(
+                """
+                CREATE TABLE program_runs (
+                    id INT NOT NULL AUTO_INCREMENT,
+                    program_id INT NOT NULL,
+                    run_index INT NOT NULL,
+                    started_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+                    stopped_at DATETIME(3) NULL,
+                    status VARCHAR(32) NOT NULL DEFAULT 'Running',
+                    PRIMARY KEY (id),
+                    UNIQUE KEY uk_program_run_index (program_id, run_index),
+                    KEY idx_program_runs_program_id (program_id),
+                    KEY idx_program_runs_status (status),
+                    CONSTRAINT fk_program_runs_program
+                      FOREIGN KEY (program_id) REFERENCES programs(ID)
+                      ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                """
+            )
+            self.db.conn.commit()
+
+        if not self._column_exists('measurements', 'run_id'):
+            self.db.cur.execute(
+                'ALTER TABLE measurements ADD COLUMN run_id INT NULL AFTER program_id;'
+            )
+            self.db.conn.commit()
+            self._backfill_measurement_run_ids()
+            try:
+                self.db.cur.execute(
+                    """
+                    ALTER TABLE measurements
+                      ADD KEY idx_measurements_run_id (run_id),
+                      ADD CONSTRAINT fk_measurements_run
+                        FOREIGN KEY (run_id) REFERENCES program_runs(id)
+                        ON DELETE CASCADE;
+                    """
+                )
+                self.db.conn.commit()
+            except Exception:
+                self.db.conn.rollback()
+        return True
+
+    def _backfill_measurement_run_ids(self) -> None:
+        self.db.cur.execute(
+            'SELECT DISTINCT program_id FROM measurements WHERE run_id IS NULL ORDER BY program_id;'
+        )
+        program_ids = [int(row[0]) for row in self.db.cur.fetchall()]
+        for program_id in program_ids:
+            self.db.cur.execute(
+                'SELECT MIN(created_at), MAX(created_at), COUNT(*) FROM measurements WHERE program_id = %s;',
+                (program_id,),
+            )
+            started_at, stopped_at, count = self.db.cur.fetchone()
+            run_id = self._create_program_run_row(
+                program_id,
+                run_index=1,
+                started_at=started_at,
+                stopped_at=stopped_at,
+                status='Stopped',
+            )
+            if run_id <= 0:
+                continue
+            self.db.cur.execute(
+                'UPDATE measurements SET run_id = %s WHERE program_id = %s AND run_id IS NULL;',
+                (run_id, program_id),
+            )
+            self.db.conn.commit()
+            _ = count
+
+    def _create_program_run_row(
+        self,
+        program_id: int,
+        *,
+        run_index: int,
+        started_at: Optional[datetime] = None,
+        stopped_at: Optional[datetime] = None,
+        status: str = 'Running',
+    ) -> int:
+        if started_at is None:
+            started_at = datetime.now()
+        sql = """
+        INSERT INTO program_runs (program_id, run_index, started_at, stopped_at, status)
+        VALUES (%s, %s, %s, %s, %s);
+        """
+        try:
+            self.db.cur.execute(sql, (program_id, run_index, started_at, stopped_at, status))
+            self.db.conn.commit()
+            return int(self.db.cur.lastrowid)
+        except Exception:
+            self.db.conn.rollback()
+            return 0
+
+    def start_program_run(self, program_id: int) -> Dict[str, Any]:
+        if not self._program_exists(program_id):
+            return {}
+        self.finish_active_program_runs(program_id, 'Stopped')
+        next_index = int(self._scalar(
+            'SELECT COALESCE(MAX(run_index), 0) + 1 FROM program_runs WHERE program_id = %s;',
+            (program_id,),
+        ) or 1)
+        run_id = self._create_program_run_row(program_id, run_index=next_index, status='Running')
+        if run_id <= 0:
+            return {}
+        self._run_start_monotonic_ns[run_id] = time.monotonic_ns()
+        row = self.get_program_run_by_id(run_id)
+        return row or {}
+
+    def finish_program_run(self, run_id: int, final_status: str = 'Stopped') -> int:
+        if run_id <= 0:
+            return 0
+        sql = """
+        UPDATE program_runs
+        SET status = %s, stopped_at = COALESCE(stopped_at, CURRENT_TIMESTAMP(3))
+        WHERE id = %s;
+        """
+        try:
+            self.db.cur.execute(sql, (final_status, run_id))
+            affected = int(self.db.cur.rowcount)
+            self.db.conn.commit()
+            self._run_start_monotonic_ns.pop(run_id, None)
+            return affected
+        except Exception:
+            self.db.conn.rollback()
+            return 0
+
+    def finish_active_program_runs(self, program_id: int, final_status: str = 'Stopped') -> int:
+        self.db.cur.execute(
+            """
+            SELECT id FROM program_runs
+            WHERE program_id = %s AND status = 'Running'
+            ORDER BY id;
+            """,
+            (program_id,),
+        )
+        run_ids = [int(row[0]) for row in self.db.cur.fetchall()]
+        total = 0
+        for run_id in run_ids:
+            total += self.finish_program_run(run_id, final_status)
+        return total
+
+    def get_program_run_by_id(self, run_id: int) -> Dict[str, Any]:
+        query = """
+        SELECT id, program_id, run_index, started_at, stopped_at, status
+        FROM program_runs
+        WHERE id = %s;
+        """
+        self.db.cur.execute(query, (run_id,))
+        row = self.db.cur.fetchone()
+        if row is None:
+            return {}
+        return self._program_run_dict(row)
+
+    def _program_run_dict(self, row: Tuple[Any, ...]) -> Dict[str, Any]:
+        run_id, program_id, run_index, started_at, stopped_at, status = row
+        started_text = started_at.isoformat(sep=' ', timespec='seconds') if hasattr(started_at, 'isoformat') else str(started_at)
+        stopped_text = None
+        if stopped_at is not None:
+            stopped_text = (
+                stopped_at.isoformat(sep=' ', timespec='seconds')
+                if hasattr(stopped_at, 'isoformat')
+                else str(stopped_at)
+            )
+        stats = self.get_measurement_stats(run_id=int(run_id))
+        return {
+            'run_id': int(run_id),
+            'program_id': int(program_id),
+            'run_index': int(run_index),
+            'label': f'{int(program_id)}.{int(run_index)}',
+            'started_at': started_text,
+            'stopped_at': stopped_text,
+            'status': str(status),
+            'measurement_stats': stats,
+        }
+
+    def list_program_runs(self, program_id: int) -> List[Dict[str, Any]]:
+        query = """
+        SELECT id, program_id, run_index, started_at, stopped_at, status
+        FROM program_runs
+        WHERE program_id = %s
+        ORDER BY run_index DESC, id DESC;
+        """
+        self.db.cur.execute(query, (program_id,))
+        return [self._program_run_dict(row) for row in self.db.cur.fetchall()]
+
+    def count_program_runs(self, program_id: int) -> int:
+        value = self._scalar(
+            'SELECT COUNT(*) FROM program_runs WHERE program_id = %s;',
+            (program_id,),
+        )
+        return int(value or 0)
+
+    def program_run_counts_all(self) -> Dict[int, int]:
+        query = """
+        SELECT program_id, COUNT(*)
+        FROM program_runs
+        GROUP BY program_id;
+        """
+        self.db.cur.execute(query)
+        return {int(program_id): int(count) for program_id, count in self.db.cur.fetchall()}
 
     def _program_exists(self, program_id: int) -> bool:
         value = self._scalar('SELECT COUNT(*) FROM programs WHERE ID = %s;', (program_id,))
@@ -234,6 +465,22 @@ class DbControl:
             self.db.conn.rollback()
             return 0
 
+    def _latest_measurement_state_for_run(self, run_id: int) -> Optional[Tuple[float, datetime]]:
+        query = """
+        SELECT elapsed_s, created_at
+        FROM measurements
+        WHERE run_id = %s
+        ORDER BY id DESC
+        LIMIT 1;
+        """
+        self.db.cur.execute(query, (run_id,))
+        row = self.db.cur.fetchone()
+        if row is None:
+            return None
+        elapsed_s = float(row[0] or 0.0)
+        created_at = row[1]
+        return elapsed_s, created_at
+
     def _latest_measurement_state(self, program_id: int) -> Optional[Tuple[float, datetime]]:
         query = """
         SELECT elapsed_s, created_at
@@ -249,6 +496,26 @@ class DbControl:
         elapsed_s = float(row[0] or 0.0)
         created_at = row[1]
         return elapsed_s, created_at
+
+    def _ensure_run_elapsed_anchor(self, run_id: int) -> None:
+        if run_id in self._run_start_monotonic_ns:
+            return
+
+        latest = self._latest_measurement_state_for_run(run_id)
+        if latest is None:
+            self._run_start_monotonic_ns[run_id] = time.monotonic_ns()
+            return
+
+        latest_elapsed_s, latest_created_at = latest
+        resume_elapsed_s = latest_elapsed_s
+        if isinstance(latest_created_at, datetime):
+            try:
+                wall_delta_s = max(0.0, (datetime.now() - latest_created_at).total_seconds())
+                resume_elapsed_s += wall_delta_s
+            except Exception:
+                pass
+
+        self._run_start_monotonic_ns[run_id] = time.monotonic_ns() - int(resume_elapsed_s * 1_000_000_000)
 
     def _ensure_program_elapsed_anchor(self, program_id: int) -> None:
         if program_id in self._program_start_monotonic_ns:
@@ -270,6 +537,12 @@ class DbControl:
 
         self._program_start_monotonic_ns[program_id] = time.monotonic_ns() - int(resume_elapsed_s * 1_000_000_000)
 
+    def _elapsed_seconds_for_run(self, run_id: int) -> float:
+        self._ensure_run_elapsed_anchor(run_id)
+        start_ns = self._run_start_monotonic_ns[run_id]
+        elapsed_s = (time.monotonic_ns() - start_ns) / 1_000_000_000.0
+        return max(0.0, elapsed_s)
+
     def _elapsed_seconds_for_program(self, program_id: int) -> float:
         self._ensure_program_elapsed_anchor(program_id)
         start_ns = self._program_start_monotonic_ns[program_id]
@@ -278,14 +551,20 @@ class DbControl:
 
     def add_measurement(self, data: Dict[str, Any]) -> int:
         program_id = self._resolve_program_id(data)
+        run_id = self._resolve_run_id(data)
+        if run_id > 0:
+            elapsed_s = self._elapsed_seconds_for_run(run_id)
+        else:
+            elapsed_s = self._elapsed_seconds_for_program(program_id)
         sql = """
         INSERT INTO measurements (
-            program_id, elapsed_s, freq, measure_ch1, measure_ch2, t_ch1, t_ch2, t_exp
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            program_id, run_id, elapsed_s, freq, measure_ch1, measure_ch2, t_ch1, t_ch2, t_exp
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         params = (
             program_id,
-            self._elapsed_seconds_for_program(program_id),
+            run_id if run_id > 0 else None,
+            elapsed_s,
             data.get('freq'),
             data.get('measure_ch1'),
             data.get('measure_ch2'),
@@ -307,16 +586,22 @@ class DbControl:
 
         sql = """
         INSERT INTO measurements (
-            program_id, elapsed_s, freq, measure_ch1, measure_ch2, t_ch1, t_ch2, t_exp
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            program_id, run_id, elapsed_s, freq, measure_ch1, measure_ch2, t_ch1, t_ch2, t_exp
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         params = []
         for row in rows:
             program_id = self._resolve_program_id(row)
+            run_id = self._resolve_run_id(row)
+            if run_id > 0:
+                elapsed_s = self._elapsed_seconds_for_run(run_id)
+            else:
+                elapsed_s = self._elapsed_seconds_for_program(program_id)
             params.append(
                 (
                     program_id,
-                    self._elapsed_seconds_for_program(program_id),
+                    run_id if run_id > 0 else None,
+                    elapsed_s,
                     row.get('freq'),
                     row.get('measure_ch1'),
                     row.get('measure_ch2'),
@@ -333,16 +618,33 @@ class DbControl:
             self.db.conn.rollback()
             return 0
 
-    def get_measurements(self, program_id: int, limit: int = 1000):
-        query = """
-        SELECT id, program_id, elapsed_s, freq, measure_ch1, measure_ch2, t_ch1, t_ch2, t_exp, created_at
-        FROM measurements
-        WHERE program_id = %s
-        ORDER BY id
-        LIMIT %s;
-        """
+    def get_measurements(
+        self,
+        program_id: int,
+        limit: int = 1000,
+        *,
+        run_id: int = 0,
+    ):
+        if run_id > 0:
+            query = """
+            SELECT id, program_id, run_id, elapsed_s, freq, measure_ch1, measure_ch2, t_ch1, t_ch2, t_exp, created_at
+            FROM measurements
+            WHERE run_id = %s
+            ORDER BY id
+            LIMIT %s;
+            """
+            params: Tuple[Any, ...] = (run_id, limit)
+        else:
+            query = """
+            SELECT id, program_id, run_id, elapsed_s, freq, measure_ch1, measure_ch2, t_ch1, t_ch2, t_exp, created_at
+            FROM measurements
+            WHERE program_id = %s
+            ORDER BY id
+            LIMIT %s;
+            """
+            params = (program_id, limit)
         try:
-            self.db.cur.execute(query, (program_id, limit))
+            self.db.cur.execute(query, params)
             return self.db.cur.fetchall()
         except Exception:
             return []
@@ -359,13 +661,21 @@ class DbControl:
             self.db.conn.rollback()
             return 0
 
-    def get_measurement_stats(self, program_id: int) -> Dict[str, Any]:
-        query = """
-        SELECT COUNT(*), MIN(elapsed_s), MAX(elapsed_s), MIN(t_ch1), MAX(t_ch1), MIN(t_ch2), MAX(t_ch2)
-        FROM measurements
-        WHERE program_id = %s;
-        """
-        self.db.cur.execute(query, (program_id,))
+    def get_measurement_stats(self, program_id: int = 0, *, run_id: int = 0) -> Dict[str, Any]:
+        if run_id > 0:
+            query = """
+            SELECT COUNT(*), MIN(elapsed_s), MAX(elapsed_s), MIN(t_ch1), MAX(t_ch1), MIN(t_ch2), MAX(t_ch2)
+            FROM measurements
+            WHERE run_id = %s;
+            """
+            self.db.cur.execute(query, (run_id,))
+        else:
+            query = """
+            SELECT COUNT(*), MIN(elapsed_s), MAX(elapsed_s), MIN(t_ch1), MAX(t_ch1), MIN(t_ch2), MAX(t_ch2)
+            FROM measurements
+            WHERE program_id = %s;
+            """
+            self.db.cur.execute(query, (program_id,))
         row = self.db.cur.fetchone()
         if row is None:
             return {}

@@ -17,7 +17,9 @@ tm is removed from the client request
 the table now stores elapsed_s instead
 elapsed_s is calculated automatically by the DB node
 experiment data uses programs, program_temp, program_meta
-measurements go into measurements
+measurements go into measurements (scoped by program_runs.run_id per experiment run)
+
+program_runs table: one row per execution of a program (labels like 4.1, 4.2 for program 4)
 freq is now numeric (DOUBLE)
 program_id is the main field name, but exp_id is still accepted for compatibility
 

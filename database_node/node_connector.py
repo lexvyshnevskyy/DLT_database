@@ -42,6 +42,10 @@ class DbService(Node, DbControl):
                 self.db.initialize_schema(str(schema_path))
             else:
                 self.get_logger().warning('Schema file not found in source or installed locations.')
+        try:
+            self.ensure_program_run_schema()
+        except Exception as exc:
+            self.get_logger().warning(f'program_runs schema migration: {exc}')
 
         self.command_dispatch: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
             'new_program': self.handler_add_program,
@@ -62,6 +66,11 @@ class DbService(Node, DbControl):
             'measurement_list': self.handle_measurement_list,
             'measurement_delete_by_program_id': self.handle_measurement_delete_by_program_id,
             'measurement_stats': self.handle_measurement_stats,
+            'program_run_start': self.handle_program_run_start,
+            'program_run_finish': self.handle_program_run_finish,
+            'program_run_list': self.handle_program_run_list,
+            'program_run_counts': self.handle_program_run_counts,
+            'program_run_finish_active': self.handle_program_run_finish_active,
         }
 
         self.service = self.create_service(Query, 'query', self.handle_query)
@@ -233,12 +242,14 @@ class DbService(Node, DbControl):
     def handle_measurement_list(self, val: Dict[str, Any]) -> Dict[str, Any]:
         try:
             program_id = int(val.get('program_id', val.get('exp_id', 0)))
+            run_id = int(val.get('run_id', 0) or 0)
             limit = int(val.get('limit', 1000))
-            response = self.get_measurements(program_id, limit)
+            response = self.get_measurements(program_id, limit, run_id=run_id)
             rows = [
                 {
                     'id': item_id,
                     'program_id': row_program_id,
+                    'run_id': row_run_id,
                     'elapsed_s': elapsed_s,
                     'freq': freq,
                     'measure_ch1': measure_ch1,
@@ -248,7 +259,19 @@ class DbService(Node, DbControl):
                     't_exp': t_exp,
                     'created_at': created_at.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
                 }
-                for item_id, row_program_id, elapsed_s, freq, measure_ch1, measure_ch2, t_ch1, t_ch2, t_exp, created_at in response
+                for (
+                    item_id,
+                    row_program_id,
+                    row_run_id,
+                    elapsed_s,
+                    freq,
+                    measure_ch1,
+                    measure_ch2,
+                    t_ch1,
+                    t_ch2,
+                    t_exp,
+                    created_at,
+                ) in response
             ]
             return {'result': 'Ok', 'row': rows}
         except Exception as exc:
@@ -265,10 +288,59 @@ class DbService(Node, DbControl):
     def handle_measurement_stats(self, val: Dict[str, Any]) -> Dict[str, Any]:
         try:
             program_id = int(val.get('program_id', val.get('exp_id', 0)))
-            response = self.get_measurement_stats(program_id)
+            run_id = int(val.get('run_id', 0) or 0)
+            if run_id > 0:
+                response = self.get_measurement_stats(run_id=run_id)
+            else:
+                response = self.get_measurement_stats(program_id)
             return {'result': 'Ok', 'row': response}
         except Exception as exc:
             return {'result': 'False', 'row': {}, 'error': str(exc)}
+
+    def handle_program_run_start(self, val: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            program_id = int(val.get('program_id', val.get('id', 0)))
+            row = self.start_program_run(program_id)
+            if not row:
+                return {'result': 'False', 'error': 'failed to start program run'}
+            return {'result': 'Ok', 'row': row}
+        except Exception as exc:
+            return {'result': 'False', 'error': str(exc)}
+
+    def handle_program_run_finish(self, val: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            run_id = int(val.get('run_id', 0))
+            status = str(val.get('status', 'Stopped'))
+            affected = self.finish_program_run(run_id, status)
+            if affected <= 0:
+                return {'result': 'False', 'error': 'run not found'}
+            return {'result': 'Ok', 'ID': run_id}
+        except Exception as exc:
+            return {'result': 'False', 'error': str(exc)}
+
+    def handle_program_run_list(self, val: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            program_id = int(val.get('program_id', val.get('id', 0)))
+            rows = self.list_program_runs(program_id)
+            return {'result': 'Ok', 'row': rows}
+        except Exception as exc:
+            return {'result': 'False', 'row': [], 'error': str(exc)}
+
+    def handle_program_run_counts(self, val: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            counts = self.program_run_counts_all()
+            rows = [f'{program_id}^{count}' for program_id, count in sorted(counts.items())]
+            return {'result': 'Ok', 'row': rows}
+        except Exception as exc:
+            return {'result': 'False', 'row': [], 'error': str(exc)}
+
+    def handle_program_run_finish_active(self, val: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            program_id = int(val.get('program_id', val.get('id', 0)))
+            count = self.finish_active_program_runs(program_id, str(val.get('status', 'Stopped')))
+            return {'result': 'Ok', 'count': count}
+        except Exception as exc:
+            return {'result': 'False', 'count': 0, 'error': str(exc)}
 
 
 def main(args=None) -> None:
