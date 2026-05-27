@@ -101,7 +101,8 @@ class DbControl:
         try:
             self.db.cur.execute(query, params)
             self.db.conn.commit()
-            return self.db.cur.rowcount > 0
+            # rowcount is 0 when ON DUPLICATE KEY UPDATE leaves values unchanged — still success
+            return True
         except Exception:
             return False
 
@@ -138,7 +139,7 @@ class DbControl:
         try:
             self.db.cur.execute(query, (int(program_id), str(key), str(value)))
             self.db.conn.commit()
-            return self.db.cur.rowcount > 0
+            return True
         except Exception:
             self.db.conn.rollback()
             return False
@@ -197,24 +198,38 @@ class DbControl:
             return 0
 
     def update_program_temp(self, data: Dict[str, Any]) -> int:
-        sql = """
-        UPDATE program_temp
-        SET
-            t_start = %s,
-            t_stop  = %s,
-            minutes = %s
-        WHERE id = %s
-        """
-        params = (
-            data['t_start'],
-            data['t_stop'],
-            data['minutes'],
-            data['id'],
-        )
+        step_id = int(data['id'])
+        program_id = int(data.get('program_id', 0) or 0)
+        if program_id > 0:
+            sql = """
+            UPDATE program_temp
+            SET t_start = %s, t_stop = %s, minutes = %s
+            WHERE id = %s AND program_id = %s
+            """
+            params = (data['t_start'], data['t_stop'], data['minutes'], step_id, program_id)
+        else:
+            sql = """
+            UPDATE program_temp
+            SET t_start = %s, t_stop = %s, minutes = %s
+            WHERE id = %s
+            """
+            params = (data['t_start'], data['t_stop'], data['minutes'], step_id)
         try:
             self.db.cur.execute(sql, params)
+            affected = int(self.db.cur.rowcount)
             self.db.conn.commit()
-            return int(self.db.cur.rowcount)
+            if affected > 0:
+                return step_id
+            check = (
+                'SELECT id FROM program_temp WHERE id = %s AND program_id = %s'
+                if program_id > 0
+                else 'SELECT id FROM program_temp WHERE id = %s'
+            )
+            check_params = (step_id, program_id) if program_id > 0 else (step_id,)
+            self.db.cur.execute(check, check_params)
+            if self.db.cur.fetchone():
+                return step_id
+            return 0
         except Exception:
             self.db.conn.rollback()
             return 0

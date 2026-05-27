@@ -208,7 +208,8 @@ class DbService(Node, DbControl):
             response = self.update_program_temp(val)
             if response:
                 return {'result': 'Ok', 'Id': response}
-            return {'result': 'False', 'ID': '0'}
+            sid = val.get('id', '?')
+            return {'result': 'False', 'ID': '0', 'error': f'step {sid} not found'}
         except Exception as exc:
             return {'result': 'False', 'ID': '0', 'error': str(exc)}
 
