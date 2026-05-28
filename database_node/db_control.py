@@ -162,6 +162,18 @@ class DbControl:
         row = self.get_program_run_by_id(run_id)
         return row or {}
 
+    def delete_program_run(self, run_id: int) -> int:
+        query = 'DELETE FROM program_runs WHERE id = %s;'
+        try:
+            self.db.cur.execute(query, (run_id,))
+            affected = int(self.db.cur.rowcount)
+            self.db.conn.commit()
+            self._run_start_monotonic_ns.pop(run_id, None)
+            return affected
+        except Exception:
+            self.db.conn.rollback()
+            return 0
+
     def finish_program_run(self, run_id: int, final_status: str = 'Stopped') -> int:
         if run_id <= 0:
             return 0
@@ -618,31 +630,47 @@ class DbControl:
             self.db.conn.rollback()
             return 0
 
+    def count_measurements_for_run(self, run_id: int) -> int:
+        value = self._scalar('SELECT COUNT(*) FROM measurements WHERE run_id = %s;', (run_id,))
+        return int(value or 0)
+
+    def get_run_distinct_frequencies(self, run_id: int) -> List[float]:
+        query = """
+        SELECT DISTINCT freq
+        FROM measurements
+        WHERE run_id = %s AND freq IS NOT NULL
+        ORDER BY freq;
+        """
+        self.db.cur.execute(query, (run_id,))
+        return [float(row[0]) for row in self.db.cur.fetchall()]
+
     def get_measurements(
         self,
         program_id: int,
         limit: int = 1000,
         *,
         run_id: int = 0,
+        offset: int = 0,
     ):
+        offset = max(0, int(offset))
         if run_id > 0:
             query = """
             SELECT id, program_id, run_id, elapsed_s, freq, measure_ch1, measure_ch2, t_ch1, t_ch2, t_exp, created_at
             FROM measurements
             WHERE run_id = %s
             ORDER BY id
-            LIMIT %s;
+            LIMIT %s OFFSET %s;
             """
-            params: Tuple[Any, ...] = (run_id, limit)
+            params: Tuple[Any, ...] = (run_id, limit, offset)
         else:
             query = """
             SELECT id, program_id, run_id, elapsed_s, freq, measure_ch1, measure_ch2, t_ch1, t_ch2, t_exp, created_at
             FROM measurements
             WHERE program_id = %s
             ORDER BY id
-            LIMIT %s;
+            LIMIT %s OFFSET %s;
             """
-            params = (program_id, limit)
+            params = (program_id, limit, offset)
         try:
             self.db.cur.execute(query, params)
             return self.db.cur.fetchall()

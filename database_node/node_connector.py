@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, List
 
 import rclpy
 from rclpy.node import Node
@@ -71,6 +71,10 @@ class DbService(Node, DbControl):
             'program_run_list': self.handle_program_run_list,
             'program_run_counts': self.handle_program_run_counts,
             'program_run_finish_active': self.handle_program_run_finish_active,
+            'program_run_delete': self.handle_program_run_delete,
+            'program_run_get': self.handle_program_run_get,
+            'measurement_list_page': self.handle_measurement_list_page,
+            'measurement_run_frequencies': self.handle_measurement_run_frequencies,
         }
 
         self.service = self.create_service(Query, 'query', self.handle_query)
@@ -244,7 +248,8 @@ class DbService(Node, DbControl):
             program_id = int(val.get('program_id', val.get('exp_id', 0)))
             run_id = int(val.get('run_id', 0) or 0)
             limit = int(val.get('limit', 1000))
-            response = self.get_measurements(program_id, limit, run_id=run_id)
+            offset = int(val.get('offset', 0) or 0)
+            response = self.get_measurements(program_id, limit, run_id=run_id, offset=offset)
             rows = [
                 {
                     'id': item_id,
@@ -341,6 +346,80 @@ class DbService(Node, DbControl):
             return {'result': 'Ok', 'count': count}
         except Exception as exc:
             return {'result': 'False', 'count': 0, 'error': str(exc)}
+
+    def handle_program_run_delete(self, val: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            run_id = int(val.get('run_id', 0))
+            affected = self.delete_program_run(run_id)
+            if affected <= 0:
+                return {'result': 'False', 'error': 'run not found'}
+            return {'result': 'Ok', 'ID': run_id}
+        except Exception as exc:
+            return {'result': 'False', 'error': str(exc)}
+
+    def handle_program_run_get(self, val: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            run_id = int(val.get('run_id', 0))
+            row = self.get_program_run_by_id(run_id)
+            if not row:
+                return {'result': 'False', 'error': 'run not found'}
+            return {'result': 'Ok', 'row': row}
+        except Exception as exc:
+            return {'result': 'False', 'error': str(exc)}
+
+    def handle_measurement_list_page(self, val: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            run_id = int(val.get('run_id', 0))
+            offset = int(val.get('offset', 0) or 0)
+            limit = int(val.get('limit', 100) or 100)
+            program_id = int(val.get('program_id', 0) or 0)
+            rows_raw = self.get_measurements(program_id, limit, run_id=run_id, offset=offset)
+            total = self.count_measurements_for_run(run_id) if run_id > 0 else 0
+            rows = self._measurement_rows_to_dicts(rows_raw)
+            return {'result': 'Ok', 'row': rows, 'total': total, 'offset': offset, 'limit': limit}
+        except Exception as exc:
+            return {'result': 'False', 'row': [], 'total': 0, 'error': str(exc)}
+
+    def handle_measurement_run_frequencies(self, val: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            run_id = int(val.get('run_id', 0))
+            freqs = self.get_run_distinct_frequencies(run_id)
+            return {'result': 'Ok', 'row': freqs}
+        except Exception as exc:
+            return {'result': 'False', 'row': [], 'error': str(exc)}
+
+    @staticmethod
+    def _measurement_rows_to_dicts(rows: List[Any]) -> List[Dict[str, Any]]:
+        result = []
+        for (
+            item_id,
+            row_program_id,
+            row_run_id,
+            elapsed_s,
+            freq,
+            measure_ch1,
+            measure_ch2,
+            t_ch1,
+            t_ch2,
+            t_exp,
+            created_at,
+        ) in rows:
+            result.append({
+                'id': item_id,
+                'program_id': row_program_id,
+                'run_id': row_run_id,
+                'elapsed_s': elapsed_s,
+                'freq': freq,
+                'measure_ch1': measure_ch1,
+                'measure_ch2': measure_ch2,
+                't_ch1': t_ch1,
+                't_ch2': t_ch2,
+                't_exp': t_exp,
+                'created_at': created_at.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                if hasattr(created_at, 'strftime')
+                else str(created_at),
+            })
+        return result
 
 
 def main(args=None) -> None:
