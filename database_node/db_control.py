@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -13,6 +14,7 @@ class DbControl:
         self.db = connector
         self._program_start_monotonic_ns: Dict[int, int] = {}
         self._run_start_monotonic_ns: Dict[int, int] = {}
+        self._elapsed_lock = threading.RLock()
 
     def _scalar(self, query: str, params: Iterable[Any]) -> Optional[Any]:
         self.db.cur.execute(query, tuple(params))
@@ -550,18 +552,20 @@ class DbControl:
         self._program_start_monotonic_ns[program_id] = time.monotonic_ns() - int(resume_elapsed_s * 1_000_000_000)
 
     def _elapsed_seconds_for_run(self, run_id: int) -> float:
-        self._ensure_run_elapsed_anchor(run_id)
-        start_ns = self._run_start_monotonic_ns[run_id]
-        elapsed_s = (time.monotonic_ns() - start_ns) / 1_000_000_000.0
-        return max(0.0, elapsed_s)
+        with self._elapsed_lock:
+            self._ensure_run_elapsed_anchor(run_id)
+            start_ns = self._run_start_monotonic_ns[run_id]
+            elapsed_s = (time.monotonic_ns() - start_ns) / 1_000_000_000.0
+            return max(0.0, elapsed_s)
 
     def _elapsed_seconds_for_program(self, program_id: int) -> float:
-        self._ensure_program_elapsed_anchor(program_id)
-        start_ns = self._program_start_monotonic_ns[program_id]
-        elapsed_s = (time.monotonic_ns() - start_ns) / 1_000_000_000.0
-        return max(0.0, elapsed_s)
+        with self._elapsed_lock:
+            self._ensure_program_elapsed_anchor(program_id)
+            start_ns = self._program_start_monotonic_ns[program_id]
+            elapsed_s = (time.monotonic_ns() - start_ns) / 1_000_000_000.0
+            return max(0.0, elapsed_s)
 
-    def add_measurement(self, data: Dict[str, Any]) -> int:
+    def _measurement_insert_params(self, data: Dict[str, Any]) -> tuple:
         program_id = self._resolve_program_id(data)
         run_id = self._resolve_run_id(data)
         if run_id > 0:
@@ -584,6 +588,10 @@ class DbControl:
             data.get('t_ch2'),
             data.get('t_exp'),
         )
+        return sql, params
+
+    def add_measurement(self, data: Dict[str, Any]) -> int:
+        sql, params = self._measurement_insert_params(data)
         try:
             self.db.cur.execute(sql, params)
             self.db.conn.commit()
@@ -591,6 +599,37 @@ class DbControl:
         except Exception:
             self.db.conn.rollback()
             return 0
+
+    def add_measurement_pooled(self, data: Dict[str, Any]) -> int:
+        """Insert on a pooled connection so UI read queries are not blocked."""
+        sql, params = self._measurement_insert_params(data)
+        conn = None
+        cur = None
+        try:
+            conn = self.db.pool.get_connection()
+            cur = conn.cursor()
+            cur.execute(sql, params)
+            conn.commit()
+            return int(cur.lastrowid)
+        except Exception as exc:
+            self.db._log('error', f'[DB] Measurement insert failed: {exc}')
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            return 0
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def add_measurements_bulk(self, rows: List[Dict[str, Any]]) -> int:
         if not rows:
@@ -622,13 +661,34 @@ class DbControl:
                     row.get('t_exp'),
                 )
             )
+
+        conn = None
+        cur = None
         try:
-            self.db.cur.executemany(sql, params)
-            self.db.conn.commit()
-            return int(self.db.cur.rowcount)
-        except Exception:
-            self.db.conn.rollback()
+            conn = self.db.pool.get_connection()
+            cur = conn.cursor(buffered=True)
+            cur.executemany(sql, params)
+            conn.commit()
+            return int(cur.rowcount)
+        except Exception as exc:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            self.db._log('error', f'[DB] Bulk insert failed: {exc}')
             return 0
+        finally:
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def count_measurements_for_run(self, run_id: int) -> int:
         value = self._scalar('SELECT COUNT(*) FROM measurements WHERE run_id = %s;', (run_id,))

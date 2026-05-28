@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import threading
+import traceback
 from pathlib import Path
 from typing import Any, Callable, Dict, List
 
 import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from database.srv import Query
@@ -24,6 +28,7 @@ class DbService(Node, DbControl):
         self.declare_parameter('db.user', 'ubuntu')
         self.declare_parameter('db.password', 'raspberry')
         self.declare_parameter('db.name', 'exp')
+        self.declare_parameter('db.pool_size', 10)
         self.declare_parameter('auto_init_schema', True)
 
         connector = DbConnector(
@@ -32,6 +37,7 @@ class DbService(Node, DbControl):
             user=self.get_parameter('db.user').value,
             password=self.get_parameter('db.password').value,
             database=self.get_parameter('db.name').value,
+            pool_size=int(self.get_parameter('db.pool_size').value),
             logger=self.get_logger(),
         )
         DbControl.__init__(self, connector)
@@ -41,16 +47,17 @@ class DbService(Node, DbControl):
             if schema_path is not None:
                 self.db.initialize_schema(str(schema_path))
             else:
-                self.get_logger().warning('Schema file not found in source or installed locations.')
+                self._safe_log_warning('Schema file not found in source or installed locations.')
         try:
             self.ensure_program_run_schema()
         except Exception as exc:
-            self.get_logger().warning(f'program_runs schema migration: {exc}')
+            self._safe_log_warning(f'program_runs schema migration: {exc}')
 
         self.command_dispatch: Dict[str, Callable[[Dict[str, Any]], Dict[str, Any]]] = {
             'new_program': self.handler_add_program,
             'get_program_by_id': self.handler_get_program_by_id,
             'program_all_list': self.handler_get_program_all,
+            'program_all_list_with_counts': self.handler_get_program_all_with_counts,
             'program_delete_by_id': self.handle_program_delete_by_id,
             'program_update_status': self.handle_program_update_status,
             'program_step_list': self.handle_program_step_list,
@@ -77,8 +84,40 @@ class DbService(Node, DbControl):
             'measurement_run_frequencies': self.handle_measurement_run_frequencies,
         }
 
-        self.service = self.create_service(Query, 'query', self.handle_query)
-        self.get_logger().info('Service [/database/query] is ready.')
+        # Protect only small in-memory state (elapsed-time anchors).
+        # DB connections/cursors are now thread-local in DbConnector, so reads
+        # and writes can run from multiple ROS service worker threads safely.
+        self._state_lock = threading.RLock()
+        self._service_cb_group = ReentrantCallbackGroup()
+        self.service = self.create_service(
+            Query,
+            'query',
+            self.handle_query,
+            callback_group=self._service_cb_group,
+        )
+        self._safe_log_info('Service [/database/query] is ready.')
+
+    def _safe_log_info(self, message: str) -> None:
+        try:
+            self.get_logger().info(message)
+        except Exception:
+            print(message, flush=True)
+
+    def _safe_log_warning(self, message: str) -> None:
+        # Use info on purpose: see DbConnector._log() note about rcutils severity
+        # caching.  The "[WARNING]" prefix keeps the visible severity meaning.
+        try:
+            self.get_logger().info(f'[WARNING] {message}')
+        except Exception:
+            print(f'[WARNING] {message}', flush=True)
+
+    def _safe_log_error(self, message: str) -> None:
+        # Use info on purpose: see DbConnector._log() note about rcutils severity
+        # caching.  The "[ERROR]" prefix keeps the visible severity meaning.
+        try:
+            self.get_logger().info(f'[ERROR] {message}')
+        except Exception:
+            print(f'[ERROR] {message}', flush=True)
 
     @staticmethod
     def _find_schema_path() -> Path | None:
@@ -95,16 +134,30 @@ class DbService(Node, DbControl):
     def handle_query(self, request: Query.Request, response: Query.Response) -> Query.Response:
         try:
             query_dict = json.loads(request.query)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
             query_dict = {}
+            self._safe_log_error(f'Invalid database query JSON: {exc}; raw={request.query!r}')
+
         cmd = str(query_dict.get('cmd', ''))
-        if cmd not in ('measurement_insert', 'measurement_bulk_insert', 'measurement_list', 'measurement_list_page'):
-            self.get_logger().info(f'Received query: {request.query}')
+        if cmd not in (
+            'measurement_insert',
+            'measurement_bulk_insert',
+            'measurement_list',
+            'measurement_list_page',
+        ):
+            self._safe_log_info(f'Received query: {request.query}')
+
         try:
             result = self.process_query(query_dict)
         except Exception as exc:
-            result = {'result': 'False', 'error': str(exc)}
-        response.response = json.dumps(result)
+            trace = traceback.format_exc(limit=6)
+            self._safe_log_error(f'Database query failed: cmd={cmd!r}; error={exc}; trace={trace}')
+            result = {
+                'result': 'False',
+                'error': str(exc),
+                'error_type': type(exc).__name__,
+            }
+        response.response = json.dumps(result, default=str)
         return response
 
     def process_query(self, query: Dict[str, Any]) -> Dict[str, Any]:
@@ -133,6 +186,18 @@ class DbService(Node, DbControl):
         try:
             response = self.get_all_programs()
             rows = [f'{value}^{dt:%Y-%m-%d %H:%M:%S}^{status}' for value, dt, status in response]
+            return {'result': 'Ok', 'row': rows}
+        except Exception as exc:
+            return {'result': 'False', 'ID': '0', 'error': str(exc)}
+
+    def handler_get_program_all_with_counts(self, _val=None) -> Dict[str, Any]:
+        try:
+            programs = self.get_all_programs()
+            counts = self.program_run_counts_all()
+            rows = [
+                f'{value}^{dt:%Y-%m-%d %H:%M:%S}^{status}^{counts.get(int(value), 0)}'
+                for value, dt, status in programs
+            ]
             return {'result': 'Ok', 'row': rows}
         except Exception as exc:
             return {'result': 'False', 'ID': '0', 'error': str(exc)}
@@ -233,7 +298,7 @@ class DbService(Node, DbControl):
 
     def handle_measurement_insert(self, val: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            response = self.add_measurement(val)
+            response = self.add_measurement_pooled(val)
             if response > 0:
                 return {'result': 'Ok', 'ID': response}
             return {'result': 'False', 'ID': '0'}
@@ -430,10 +495,13 @@ class DbService(Node, DbControl):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = DbService()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     finally:
         node.db.close()
+        executor.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 
