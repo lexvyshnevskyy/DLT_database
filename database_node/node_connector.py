@@ -93,9 +93,14 @@ class DbService(Node, DbControl):
         return None
 
     def handle_query(self, request: Query.Request, response: Query.Response) -> Query.Response:
-        self.get_logger().info(f'Received query: {request.query}')
         try:
             query_dict = json.loads(request.query)
+        except json.JSONDecodeError:
+            query_dict = {}
+        cmd = str(query_dict.get('cmd', ''))
+        if cmd not in ('measurement_insert', 'measurement_bulk_insert', 'measurement_list', 'measurement_list_page'):
+            self.get_logger().info(f'Received query: {request.query}')
+        try:
             result = self.process_query(query_dict)
         except Exception as exc:
             result = {'result': 'False', 'error': str(exc)}
