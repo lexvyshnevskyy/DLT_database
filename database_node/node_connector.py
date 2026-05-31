@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import threading
 import traceback
 from pathlib import Path
 from typing import Any, Callable, Dict, List
@@ -84,10 +83,8 @@ class DbService(Node, DbControl):
             'measurement_run_frequencies': self.handle_measurement_run_frequencies,
         }
 
-        # Protect only small in-memory state (elapsed-time anchors).
-        # DB connections/cursors are now thread-local in DbConnector, so reads
-        # and writes can run from multiple ROS service worker threads safely.
-        self._state_lock = threading.RLock()
+        # Elapsed-time anchor dicts are protected by DbControl._state_lock.
+        # DB connections/cursors are thread-local in DbConnector for SQL I/O.
         self._service_cb_group = ReentrantCallbackGroup()
         self.service = self.create_service(
             Query,

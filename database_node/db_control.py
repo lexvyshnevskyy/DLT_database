@@ -14,7 +14,8 @@ class DbControl:
         self.db = connector
         self._program_start_monotonic_ns: Dict[int, int] = {}
         self._run_start_monotonic_ns: Dict[int, int] = {}
-        self._elapsed_lock = threading.RLock()
+        # Protects elapsed-time anchor dicts (multi-threaded /database/query service).
+        self._state_lock = threading.RLock()
 
     def _scalar(self, query: str, params: Iterable[Any]) -> Optional[Any]:
         self.db.cur.execute(query, tuple(params))
@@ -160,7 +161,8 @@ class DbControl:
         run_id = self._create_program_run_row(program_id, run_index=next_index, status='Running')
         if run_id <= 0:
             return {}
-        self._run_start_monotonic_ns[run_id] = time.monotonic_ns()
+        with self._state_lock:
+            self._run_start_monotonic_ns[run_id] = time.monotonic_ns()
         row = self.get_program_run_by_id(run_id)
         return row or {}
 
@@ -170,7 +172,8 @@ class DbControl:
             self.db.cur.execute(query, (run_id,))
             affected = int(self.db.cur.rowcount)
             self.db.conn.commit()
-            self._run_start_monotonic_ns.pop(run_id, None)
+            with self._state_lock:
+                self._run_start_monotonic_ns.pop(run_id, None)
             return affected
         except Exception:
             self.db.conn.rollback()
@@ -188,7 +191,8 @@ class DbControl:
             self.db.cur.execute(sql, (final_status, run_id))
             affected = int(self.db.cur.rowcount)
             self.db.conn.commit()
-            self._run_start_monotonic_ns.pop(run_id, None)
+            with self._state_lock:
+                self._run_start_monotonic_ns.pop(run_id, None)
             return affected
         except Exception:
             self.db.conn.rollback()
@@ -289,7 +293,8 @@ class DbControl:
             self.db.cur.execute(query, (program_id,))
             affected = int(self.db.cur.rowcount)
             self.db.conn.commit()
-            self._program_start_monotonic_ns.pop(program_id, None)
+            with self._state_lock:
+                self._program_start_monotonic_ns.pop(program_id, None)
             return affected
         except Exception:
             self.db.conn.rollback()
@@ -511,64 +516,68 @@ class DbControl:
         created_at = row[1]
         return elapsed_s, created_at
 
-    def _ensure_run_elapsed_anchor(self, run_id: int) -> None:
+    def _resume_elapsed_anchor_ns(
+        self,
+        latest: Optional[Tuple[float, datetime]],
+    ) -> int:
+        if latest is None:
+            return time.monotonic_ns()
+        latest_elapsed_s, latest_created_at = latest
+        resume_elapsed_s = latest_elapsed_s
+        if isinstance(latest_created_at, datetime):
+            try:
+                wall_delta_s = max(0.0, (datetime.now() - latest_created_at).total_seconds())
+                resume_elapsed_s += wall_delta_s
+            except Exception:
+                pass
+        return time.monotonic_ns() - int(max(0.0, resume_elapsed_s) * 1_000_000_000)
+
+    def _init_run_anchor_locked(
+        self,
+        run_id: int,
+        latest: Optional[Tuple[float, datetime]],
+    ) -> None:
+        """Initialize run anchor if missing. Caller must hold ``_state_lock``."""
         if run_id in self._run_start_monotonic_ns:
             return
+        self._run_start_monotonic_ns[run_id] = self._resume_elapsed_anchor_ns(latest)
 
-        latest = self._latest_measurement_state_for_run(run_id)
-        if latest is None:
-            self._run_start_monotonic_ns[run_id] = time.monotonic_ns()
-            return
-
-        latest_elapsed_s, latest_created_at = latest
-        resume_elapsed_s = latest_elapsed_s
-        if isinstance(latest_created_at, datetime):
-            try:
-                wall_delta_s = max(0.0, (datetime.now() - latest_created_at).total_seconds())
-                resume_elapsed_s += wall_delta_s
-            except Exception:
-                pass
-
-        self._run_start_monotonic_ns[run_id] = time.monotonic_ns() - int(resume_elapsed_s * 1_000_000_000)
-
-    def _ensure_program_elapsed_anchor(self, program_id: int) -> None:
+    def _init_program_anchor_locked(
+        self,
+        program_id: int,
+        latest: Optional[Tuple[float, datetime]],
+    ) -> None:
+        """Initialize program anchor if missing. Caller must hold ``_state_lock``."""
         if program_id in self._program_start_monotonic_ns:
             return
-
-        latest = self._latest_measurement_state(program_id)
-        if latest is None:
-            self._program_start_monotonic_ns[program_id] = time.monotonic_ns()
-            return
-
-        latest_elapsed_s, latest_created_at = latest
-        resume_elapsed_s = latest_elapsed_s
-        if isinstance(latest_created_at, datetime):
-            try:
-                wall_delta_s = max(0.0, (datetime.now() - latest_created_at).total_seconds())
-                resume_elapsed_s += wall_delta_s
-            except Exception:
-                pass
-
-        self._program_start_monotonic_ns[program_id] = time.monotonic_ns() - int(resume_elapsed_s * 1_000_000_000)
+        self._program_start_monotonic_ns[program_id] = self._resume_elapsed_anchor_ns(latest)
 
     def _elapsed_seconds_for_run(self, run_id: int) -> float:
-        with self._elapsed_lock:
-            self._ensure_run_elapsed_anchor(run_id)
+        with self._state_lock:
+            if run_id in self._run_start_monotonic_ns:
+                start_ns = self._run_start_monotonic_ns[run_id]
+                return max(0.0, (time.monotonic_ns() - start_ns) / 1_000_000_000.0)
+        latest = self._latest_measurement_state_for_run(run_id)
+        with self._state_lock:
+            self._init_run_anchor_locked(run_id, latest)
             start_ns = self._run_start_monotonic_ns[run_id]
-            elapsed_s = (time.monotonic_ns() - start_ns) / 1_000_000_000.0
-            return max(0.0, elapsed_s)
+            return max(0.0, (time.monotonic_ns() - start_ns) / 1_000_000_000.0)
 
     def _elapsed_seconds_for_program(self, program_id: int) -> float:
-        with self._elapsed_lock:
-            self._ensure_program_elapsed_anchor(program_id)
+        with self._state_lock:
+            if program_id in self._program_start_monotonic_ns:
+                start_ns = self._program_start_monotonic_ns[program_id]
+                return max(0.0, (time.monotonic_ns() - start_ns) / 1_000_000_000.0)
+        latest = self._latest_measurement_state(program_id)
+        with self._state_lock:
+            self._init_program_anchor_locked(program_id, latest)
             start_ns = self._program_start_monotonic_ns[program_id]
-            elapsed_s = (time.monotonic_ns() - start_ns) / 1_000_000_000.0
-            return max(0.0, elapsed_s)
+            return max(0.0, (time.monotonic_ns() - start_ns) / 1_000_000_000.0)
 
     def _sync_elapsed_anchor(self, *, run_id: int, program_id: int, elapsed_s: float) -> None:
         """Keep DB monotonic anchor aligned with client-supplied scheduler elapsed."""
         anchor_ns = time.monotonic_ns() - int(max(0.0, float(elapsed_s)) * 1_000_000_000)
-        with self._elapsed_lock:
+        with self._state_lock:
             if run_id > 0:
                 self._run_start_monotonic_ns[run_id] = anchor_ns
             elif program_id > 0:
@@ -762,7 +771,8 @@ class DbControl:
             self.db.cur.execute(query, (program_id,))
             affected = int(self.db.cur.rowcount)
             self.db.conn.commit()
-            self._program_start_monotonic_ns.pop(program_id, None)
+            with self._state_lock:
+                self._program_start_monotonic_ns.pop(program_id, None)
             return affected
         except Exception:
             self.db.conn.rollback()
