@@ -38,14 +38,9 @@ New insert shape:
 
 How elapsed_s works now:
 
-first measurement for a program gets time base 0
-later rows use monotonic time inside the DB node
-so RTC absence is not a problem for normal experiment timing
-
-One important caveat:
-
-if the DB node restarts during an experiment, it resumes elapsed_s approximately from the last stored row
-that is good enough for now, but not mathematically perfect across restarts
+- During a program run, **core** sends `elapsed_s` on each `measurement_insert` (step-based scheduler clock — same as live UI progress).
+- The DB node stores that value and syncs its monotonic anchor so bulk/legacy inserts without `elapsed_s` stay consistent.
+- If `elapsed_s` is omitted (older clients), the DB node falls back to run/program monotonic anchors (resume from last row after restart).
 
 So this is the cleanest practical design for current architecture:
 

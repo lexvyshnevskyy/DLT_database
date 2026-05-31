@@ -565,13 +565,35 @@ class DbControl:
             elapsed_s = (time.monotonic_ns() - start_ns) / 1_000_000_000.0
             return max(0.0, elapsed_s)
 
+    def _sync_elapsed_anchor(self, *, run_id: int, program_id: int, elapsed_s: float) -> None:
+        """Keep DB monotonic anchor aligned with client-supplied scheduler elapsed."""
+        anchor_ns = time.monotonic_ns() - int(max(0.0, float(elapsed_s)) * 1_000_000_000)
+        with self._elapsed_lock:
+            if run_id > 0:
+                self._run_start_monotonic_ns[run_id] = anchor_ns
+            elif program_id > 0:
+                self._program_start_monotonic_ns[program_id] = anchor_ns
+
+    def _resolve_measurement_elapsed_s(self, data: Dict[str, Any], program_id: int, run_id: int) -> float:
+        if data.get('elapsed_s') is not None:
+            try:
+                elapsed_s = max(0.0, float(data['elapsed_s']))
+            except (TypeError, ValueError):
+                elapsed_s = 0.0
+            self._sync_elapsed_anchor(
+                run_id=run_id,
+                program_id=program_id,
+                elapsed_s=elapsed_s,
+            )
+            return elapsed_s
+        if run_id > 0:
+            return self._elapsed_seconds_for_run(run_id)
+        return self._elapsed_seconds_for_program(program_id)
+
     def _measurement_insert_params(self, data: Dict[str, Any]) -> tuple:
         program_id = self._resolve_program_id(data)
         run_id = self._resolve_run_id(data)
-        if run_id > 0:
-            elapsed_s = self._elapsed_seconds_for_run(run_id)
-        else:
-            elapsed_s = self._elapsed_seconds_for_program(program_id)
+        elapsed_s = self._resolve_measurement_elapsed_s(data, program_id, run_id)
         sql = """
         INSERT INTO measurements (
             program_id, run_id, elapsed_s, freq, measure_ch1, measure_ch2, t_ch1, t_ch2, t_exp
@@ -644,10 +666,7 @@ class DbControl:
         for row in rows:
             program_id = self._resolve_program_id(row)
             run_id = self._resolve_run_id(row)
-            if run_id > 0:
-                elapsed_s = self._elapsed_seconds_for_run(run_id)
-            else:
-                elapsed_s = self._elapsed_seconds_for_program(program_id)
+            elapsed_s = self._resolve_measurement_elapsed_s(row, program_id, run_id)
             params.append(
                 (
                     program_id,
